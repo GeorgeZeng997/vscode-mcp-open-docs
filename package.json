@@ -1,0 +1,44 @@
+{
+  "name": "vscode-mcp-open-docs",
+  "displayName": "VS Code MCP (Open Docs)",
+  "version": "0.1.0",
+  "description": "MCP server that reads via VS Code opened documents (opens on demand).",
+  "publisher": "local",
+  "main": "extension.js",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "configuration": {
+      "type": "object",
+      "title": "VS Code MCP (Open Docs)",
+      "properties": {
+        "vscodeMcp.port": {
+          "type": "number",
+          "default": 7310,
+          "description": "WebSocket port for the MCP server."
+        },
+        "vscodeMcp.autoOpenDocument": {
+          "type": "boolean",
+          "default": true,
+          "description": "Open a document in VS Code before reading it."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "echo \"No tests\""
+  },
+  "keywords": [
+    "mcp",
+    "vscode"
+  ],
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "ws": "^8.19.0"
+  }
+}
