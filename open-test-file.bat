@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableDelayedExpansion
-set ROOT=%~dp0
-set FILE=%ROOT%test-mcp-file.js
+set "ROOT=%~dp0"
+set "FILE=%ROOT%test-mcp-file.js"
 
 rem Prefer explicit VS Code command if provided.
 if defined VS_CODE_CMD (
@@ -18,19 +18,18 @@ if defined VS_CODE_CMD (
   if not exist "!CODE_CMD!" set "CODE_CMD=!ProgramFiles(x86)!\Microsoft VS Code\bin\code.cmd"
   if not exist "!CODE_CMD!" set "CODE_CMD=code"
 )
- 
-:code_found
 
-echo Opening VS Code (extension dev host)...
-start "" "D:\Microsoft VS Code\bin\code.cmd" --new-window --extensionDevelopmentPath "%ROOT%" "%ROOT%"
+:code_found
+echo Opening VS Code (Extension Development Host)...
+start "" "!CODE_CMD!" --new-window --extensionDevelopmentPath "%ROOT%" "%ROOT%"
 if errorlevel 1 (
-  echo Failed to launch VS Code or open file.
-  echo If this opened Cursor, set VS_CODE_CMD to your VS Code code.cmd path.
+  echo Failed to launch VS Code.
+  echo Set VS_CODE_CMD to your VS Code code.cmd path if needed.
   exit /b 1
 )
 
 echo Opening test file in VS Code...
-start "" "D:\Microsoft VS Code\bin\code.cmd" -g "%FILE%"
+start "" "!CODE_CMD!" -g "%FILE%"
 if errorlevel 1 (
   echo Failed to open test file.
   exit /b 1

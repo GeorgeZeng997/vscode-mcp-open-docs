@@ -1,253 +1,307 @@
-const WebSocket = require('ws');
+'use strict';
 
 const fs = require('fs');
-const path = require('path');
+const WebSocket = require('ws');
+const {
+  PROTOCOL_VERSION,
+  SERVER_INFO,
+  TOOLS_SCHEMA,
+  FrameParser,
+  formatFramedMessage
+} = require('./lib/mcp-protocol');
 
-const wsUrl = process.env.MCP_WS_URL || 'ws://localhost:7310';
-const logPath = path.join(__dirname, 'mcp-stdio.log');
+const wsUrl = process.env.MCP_WS_URL || 'ws://127.0.0.1:7310';
+const authToken = process.env.MCP_AUTH_TOKEN || '';
+const connectTimeoutMs = Number.parseInt(process.env.MCP_CONNECT_TIMEOUT_MS || '4000', 10);
+const logPath = process.env.MCP_LOG_FILE || '';
+const debugEnabled = process.env.MCP_DEBUG === '1' || Boolean(logPath);
 
 function log(line) {
+  if (!debugEnabled) {
+    return;
+  }
   const msg = `${new Date().toISOString()} ${line}\n`;
-  try {
-    fs.appendFileSync(logPath, msg, 'utf8');
-  } catch (err) {
-    // ignore
+  if (logPath) {
+    try {
+      fs.appendFileSync(logPath, msg, 'utf8');
+    } catch (_err) {
+      // ignore log file write errors
+    }
   }
   console.error(line);
 }
-let ws;
+
+let ws = null;
 let wsOpen = false;
-const pending = [];
+let stdinEnded = false;
+const pending = []; // { body, id, timer }
+const inFlightIds = new Set();
+const parser = new FrameParser();
+
+const keepAliveInterval = setInterval(() => {}, 60000);
+
+function maybeShutdownAfterStdinEnd() {
+  if (!stdinEnded) {
+    return;
+  }
+  if (pending.length === 0 && inFlightIds.size === 0) {
+    clearInterval(keepAliveInterval);
+    if (ws) {
+      try {
+        ws.close();
+      } catch (_err) {
+        // ignore
+      }
+    }
+  }
+}
+
+function buildWsOptions() {
+  const headers = {};
+  if (authToken) {
+    headers.Authorization = `Bearer ${authToken}`;
+  }
+  return { headers, handshakeTimeout: connectTimeoutMs };
+}
+
+function dispatchOverOpenWs(body, id) {
+  if (id !== null && id !== undefined) {
+    inFlightIds.add(id);
+  }
+  ws.send(body);
+}
+
+function failPending(reason) {
+  while (pending.length > 0) {
+    const item = pending.shift();
+    if (item.timer) {
+      clearTimeout(item.timer);
+    }
+    if (item.id !== null && item.id !== undefined) {
+      writeMessage(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: item.id,
+          error: {
+            code: -32001,
+            message: reason
+          }
+        })
+      );
+    }
+  }
+  maybeShutdownAfterStdinEnd();
+}
 
 function connectWs() {
-  ws = new WebSocket(wsUrl);
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+
+  ws = new WebSocket(wsUrl, buildWsOptions());
 
   ws.on('open', () => {
     wsOpen = true;
-    for (const msg of pending.splice(0)) {
-      ws.send(msg);
+    log(`mcp-stdio: connected to ${wsUrl}`);
+    while (pending.length > 0) {
+      const item = pending.shift();
+      if (item.timer) {
+        clearTimeout(item.timer);
+      }
+      dispatchOverOpenWs(item.body, item.id);
     }
   });
 
   ws.on('message', (data) => {
-    const text = data.toString();
+    const text = data.toString('utf8');
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && parsed.id !== undefined && parsed.id !== null) {
+        inFlightIds.delete(parsed.id);
+      }
+    } catch (_err) {
+      // pass raw payload through
+    }
     writeMessage(text);
+    maybeShutdownAfterStdinEnd();
+  });
+
+  ws.on('close', () => {
+    wsOpen = false;
+    log('mcp-stdio: websocket closed');
+    if (inFlightIds.size > 0) {
+      for (const id of Array.from(inFlightIds)) {
+        inFlightIds.delete(id);
+        writeMessage(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id,
+            error: {
+              code: -32002,
+              message: 'VS Code MCP WebSocket connection closed before replying.'
+            }
+          })
+        );
+      }
+    }
+    maybeShutdownAfterStdinEnd();
   });
 
   ws.on('error', (err) => {
-    console.error(`ws error: ${err.message || err}`);
+    wsOpen = false;
+    log(`mcp-stdio: ws error: ${err && err.message ? err.message : err}`);
   });
 }
 
 connectWs();
 
-let buffer = Buffer.alloc(0);
-log('mcp-stdio: started');
-log(`mcp-stdio: ws url ${wsUrl}`);
-let responseMode = null; // 'header' or 'json'
-// Keep process alive even if stdin is closed and ws is idle.
-setInterval(() => {}, 1000);
 process.stdin.on('data', (chunk) => {
   log(`mcp-stdio: stdin ${chunk.length} bytes`);
-  buffer = Buffer.concat([buffer, chunk]);
-  parseMessages();
+  let frames;
+  try {
+    frames = parser.push(chunk);
+  } catch (err) {
+    process.stderr.write(`${err.message}\n`);
+    return;
+  }
+  for (const body of frames) {
+    handleMessage(body);
+  }
 });
 
 process.stdin.on('end', () => {
   log('mcp-stdio: stdin ended');
-  // Keep process alive; Codex may close stdin but still expect responses.
+  stdinEnded = true;
+  maybeShutdownAfterStdinEnd();
 });
-
-process.on('exit', (code) => {
-  log(`mcp-stdio: exit ${code}`);
-});
-
-function parseMessages() {
-  while (true) {
-    // Log raw buffer when any data arrives to aid debugging.
-    if (buffer.length > 0) {
-      log(`mcp-stdio: buffer ${buffer.length} bytes: ${previewBuffer(buffer)}`);
-    }
-    const headerEnd = findHeaderEnd(buffer);
-    if (headerEnd === -1) {
-      if (!tryParseJsonLines()) {
-        if (buffer.length > 0) {
-          log(`mcp-stdio: unparsed ${buffer.length} bytes: ${previewBuffer(buffer)}`);
-        }
-        return;
-      }
-      continue;
-    }
-
-    responseMode = responseMode || 'header';
-    const headerText = buffer.slice(0, headerEnd).toString('utf8');
-    log(`mcp-stdio: header ${headerText.replace(/\r?\n/g, '\\n')}`);
-    const contentLength = parseContentLength(headerText);
-    if (contentLength === null) {
-      process.stderr.write('Invalid MCP header: missing Content-Length\n');
-      process.exit(1);
-    }
-
-    const bodyStart = headerEnd + (buffer[headerEnd] === 13 ? 4 : 2);
-    if (buffer.length < bodyStart + contentLength) {
-      const need = bodyStart + contentLength - buffer.length;
-      log(`mcp-stdio: waiting for ${need} more bytes`);
-      return;
-    }
-
-    const body = buffer.slice(bodyStart, bodyStart + contentLength).toString('utf8');
-    buffer = buffer.slice(bodyStart + contentLength);
-    log(`mcp-stdio: body ${previewBuffer(Buffer.from(body, 'utf8'))}`);
-    handleMessage(body);
-  }
-}
-
-function findHeaderEnd(buf) {
-  const crlf = buf.indexOf('\r\n\r\n');
-  if (crlf !== -1) return crlf;
-  const lf = buf.indexOf('\n\n');
-  return lf;
-}
-
-function parseContentLength(headerText) {
-  const lines = headerText.split(/\r?\n/);
-  for (const line of lines) {
-    const match = /^Content-Length:\s*(\d+)\s*$/i.exec(line);
-    if (match) {
-      return Number.parseInt(match[1], 10);
-    }
-  }
-  return null;
-}
-
-function sendToWs(body) {
-  if (wsOpen) {
-    ws.send(body);
-  } else {
-    pending.push(body);
-    if (!ws || ws.readyState === WebSocket.CLOSED) {
-      connectWs();
-    }
-  }
-}
 
 function writeMessage(jsonText) {
-  const len = Buffer.byteLength(jsonText, 'utf8');
-  log(`mcp-stdio: write ${len} bytes`);
-  if (responseMode === 'json') {
-    process.stdout.write(`${jsonText}\n`);
-  } else {
-    process.stdout.write(`Content-Length: ${len}\r\n\r\n${jsonText}`);
-  }
+  const mode = parser.mode || 'header';
+  const framed = formatFramedMessage(jsonText, mode);
+  log(`mcp-stdio: write ${Buffer.byteLength(jsonText, 'utf8')} bytes (${mode})`);
+  process.stdout.write(framed);
 }
 
-function tryParseJsonLines() {
-  const text = buffer.toString('utf8').trim();
-  if (!text) {
-    return false;
+function sendToWs(body, id) {
+  if (wsOpen && ws && ws.readyState === WebSocket.OPEN) {
+    dispatchOverOpenWs(body, id);
+    return;
   }
 
-  // If it looks like newline-delimited JSON, process line by line.
-  if (text.includes('\n') || text.includes('\r')) {
-    const lines = text.split(/\r?\n/);
-    responseMode = responseMode || 'json';
-    buffer = Buffer.alloc(0);
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed) {
-        handleMessage(trimmed);
+  const entry = { body, id, timer: null };
+  if (id !== null && id !== undefined) {
+    entry.timer = setTimeout(() => {
+      const idx = pending.indexOf(entry);
+      if (idx !== -1) {
+        pending.splice(idx, 1);
       }
-    }
-    return true;
+      writeMessage(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id,
+          error: {
+            code: -32001,
+            message: `Cannot connect to VS Code MCP WebSocket at ${wsUrl}. Ensure the VS Code extension is running.`
+          }
+        })
+      );
+      maybeShutdownAfterStdinEnd();
+    }, connectTimeoutMs);
   }
-
-  // If it looks like a single JSON object without headers, accept it.
-  if (text.startsWith('{') && text.endsWith('}')) {
-    responseMode = responseMode || 'json';
-    buffer = Buffer.alloc(0);
-    handleMessage(text);
-    return true;
-  }
-
-  return false;
-}
-
-function previewBuffer(buf) {
-  const slice = buf.slice(0, 200).toString('utf8');
-  return slice.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
+  pending.push(entry);
+  connectWs();
 }
 
 function handleMessage(body) {
   let msg;
   try {
     msg = JSON.parse(body);
-  } catch (err) {
-    sendToWs(body);
+  } catch (_err) {
+    sendToWs(body, null);
     return;
   }
 
   if (!msg || msg.jsonrpc !== '2.0' || !msg.method) {
-    sendToWs(body);
+    sendToWs(body, msg && msg.id !== undefined ? msg.id : null);
     return;
   }
 
   if (msg.method === 'notifications/initialized') {
+    maybeShutdownAfterStdinEnd();
     return;
   }
 
   if (msg.method === 'initialize') {
-    const response = {
-      jsonrpc: '2.0',
-      id: msg.id ?? null,
-      result: {
-        protocolVersion: '2024-11-05',
-        capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: 'vscode-mcp-open-docs', version: '0.1.0' }
-      }
-    };
-    writeMessage(JSON.stringify(response));
+    writeMessage(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: msg.id ?? null,
+        result: {
+          protocolVersion: PROTOCOL_VERSION,
+          capabilities: { tools: { listChanged: false } },
+          serverInfo: SERVER_INFO
+        }
+      })
+    );
+    maybeShutdownAfterStdinEnd();
     return;
   }
 
   if (msg.method === 'tools/list') {
-    const response = {
-      jsonrpc: '2.0',
-      id: msg.id ?? null,
-      result: {
-        tools: [
-          {
-            name: 'listOpenDocuments',
-            description: 'List documents currently open in VS Code.',
-            inputSchema: { type: 'object', properties: {} }
-          },
-          {
-            name: 'readDocument',
-            description: 'Open (if needed) and read a document via VS Code. Provide uri or path.',
-            inputSchema: {
-              type: 'object',
-              properties: { uri: { type: 'string' }, path: { type: 'string' } },
-              anyOf: [{ required: ['uri'] }, { required: ['path'] }]
-            }
-          },
-          {
-            name: 'searchOpenDocuments',
-            description: 'Search in currently open documents.',
-            inputSchema: {
-              type: 'object',
-              properties: {
-                query: { type: 'string' },
-                isCaseSensitive: { type: 'boolean' },
-                isRegex: { type: 'boolean' }
-              },
-              required: ['query']
-            }
-          }
-        ]
-      }
-    };
-    writeMessage(JSON.stringify(response));
+    writeMessage(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: msg.id ?? null,
+        result: { tools: TOOLS_SCHEMA }
+      })
+    );
+    maybeShutdownAfterStdinEnd();
     return;
   }
 
-  sendToWs(body);
+  if (
+    msg.method === 'tools/call' &&
+    msg.params &&
+    msg.params.name === 'ping' &&
+    (!wsOpen || !ws || ws.readyState !== WebSocket.OPEN)
+  ) {
+    writeMessage(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: msg.id ?? null,
+        result: {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  ok: true,
+                  connectedToVsCode: false,
+                  wsUrl,
+                  server: SERVER_INFO,
+                  hint: 'Bridge is healthy, waiting for VS Code extension WebSocket listener.'
+                },
+                null,
+                2
+              )
+            }
+          ]
+        }
+      })
+    );
+    maybeShutdownAfterStdinEnd();
+    return;
+  }
+
+  if (msg.method === 'shutdown') {
+    failPending('MCP bridge shutting down');
+    writeMessage(JSON.stringify({ jsonrpc: '2.0', id: msg.id ?? null, result: null }));
+    if (ws) {
+      ws.close();
+    }
+    maybeShutdownAfterStdinEnd();
+    return;
+  }
+
+  sendToWs(body, msg.id ?? null);
 }
