@@ -1,12 +1,13 @@
 {
   "name": "vscode-mcp-open-docs",
   "displayName": "VS Code MCP (Open Docs)",
-  "version": "0.1.0",
-  "description": "MCP server that reads via VS Code opened documents (opens on demand).",
+  "version": "0.2.0",
+  "description": "Model Context Protocol (MCP) server & stdio bridge for reading, searching, and navigating VS Code open documents.",
   "publisher": "local",
   "main": "extension.js",
   "engines": {
-    "vscode": "^1.85.0"
+    "vscode": "^1.85.0",
+    "node": ">=18.0.0"
   },
   "activationEvents": [
     "onStartupFinished"
@@ -16,6 +17,11 @@
       "type": "object",
       "title": "VS Code MCP (Open Docs)",
       "properties": {
+        "vscodeMcp.host": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Loopback interface address for the local MCP WebSocket server."
+        },
         "vscodeMcp.port": {
           "type": "number",
           "default": 7310,
@@ -24,21 +30,36 @@
         "vscodeMcp.autoOpenDocument": {
           "type": "boolean",
           "default": true,
-          "description": "Open a document in VS Code before reading it."
+          "description": "Show a document in the VS Code editor when reading it."
+        },
+        "vscodeMcp.restrictToWorkspace": {
+          "type": "boolean",
+          "default": false,
+          "description": "Reject file read/open requests outside currently open VS Code workspace folders."
+        },
+        "vscodeMcp.authToken": {
+          "type": "string",
+          "default": "",
+          "description": "Optional shared token required from MCP WebSocket clients (via Authorization Bearer or x-mcp-token header)."
         }
       }
     }
   },
   "scripts": {
-    "test": "echo \"No tests\""
+    "test": "node --test test/*.test.js",
+    "check": "node --check extension.js && node --check mcp-stdio.js && node --check lib/mcp-protocol.js"
   },
   "keywords": [
     "mcp",
-    "vscode"
+    "model-context-protocol",
+    "vscode",
+    "vscode-extension",
+    "llm",
+    "codex"
   ],
   "license": "MIT",
   "type": "commonjs",
   "dependencies": {
-    "ws": "^8.19.0"
+    "ws": "^8.20.2"
   }
 }

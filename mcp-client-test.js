@@ -1,7 +1,10 @@
+'use strict';
+
+const path = require('path');
 const WebSocket = require('ws');
 
-const expectedPath = process.argv[2] || '';
-const url = 'ws://localhost:7310';
+const expectedPath = process.argv[2] || path.join(__dirname, 'test-mcp-file.js');
+const url = process.env.MCP_WS_URL || 'ws://127.0.0.1:7310';
 const maxAttempts = 20;
 let attempts = 0;
 
@@ -33,13 +36,13 @@ function connect() {
   });
 
   ws.on('message', (data) => {
-    const text = data.toString();
+    const text = data.toString('utf8');
     console.log('<<', text);
 
     let msg;
     try {
       msg = JSON.parse(text);
-    } catch (err) {
+    } catch (_err) {
       return;
     }
 
@@ -62,7 +65,9 @@ function connect() {
   });
 
   ws.on('close', () => {
-    console.log('Done.');
+    if (pending.size === 0) {
+      console.log('Done.');
+    }
   });
 }
 
